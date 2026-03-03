@@ -8,7 +8,10 @@ import numpy as np
 import pandas as pd
 
 import matplotlib.pyplot as plt
-from orbit.models import DLT
+try:
+    from orbit.models import DLT
+except Exception:
+    DLT = None
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.api import VAR
 from statsmodels.tsa.stattools import adfuller
@@ -298,56 +301,57 @@ def run_pipeline(
                 notes += f" SARIMAX model failed: {e}"
                 continue
 
-            # BSTS forecast plot (your existing approach)
-            ts_bsts = df_interpolated[[target]].reset_index()
-            ts_bsts.columns = ["date", "value"]
+            # BSTS forecast plot (Orbit DLT). Skip if Orbit isn't installed on the host.
+            if DLT is not None:
+                ts_bsts = df_interpolated[[target]].reset_index()
+                ts_bsts.columns = ["date", "value"]
 
-            bsts_model = DLT(response_col="value", date_col="date", seasonality=12, seed=42)
-            bsts_model.fit(ts_bsts)
+                bsts_model = DLT(response_col="value", date_col="date", seasonality=12, seed=42)
+                bsts_model.fit(ts_bsts)
 
-            bsts_fit = bsts_model.predict(ts_bsts)
-            ts_bsts["bsts_pred"] = bsts_fit["prediction"]
+                bsts_fit = bsts_model.predict(ts_bsts)
+                ts_bsts["bsts_pred"] = bsts_fit["prediction"]
 
-            future_all = bsts_model.predict(df=ts_bsts[["date", "value"]], forecast_horizon=cfg.forecast_steps)
-            future_dates = pd.date_range(
-                start=ts_bsts["date"].max(),
-                periods=cfg.forecast_steps + 1,
-                freq=cfg.forecast_freq,
-            )[1:]
+                future_all = bsts_model.predict(df=ts_bsts[["date", "value"]], forecast_horizon=cfg.forecast_steps)
+                future_dates = pd.date_range(
+                    start=ts_bsts["date"].max(),
+                    periods=cfg.forecast_steps + 1,
+                    freq=cfg.forecast_freq,
+                )[1:]
 
-            if "forecast_index" in future_all.columns:
-                future = (
-                    future_all.groupby("forecast_index")["prediction"]
-                    .mean()
-                    .reset_index(drop=True)
-                    .to_frame("prediction")
-                )
-            else:
-                draws_per_step = max(1, len(future_all) // cfg.forecast_steps)
-                tail = future_all.tail(draws_per_step * cfg.forecast_steps).reset_index(drop=True)
-                future = (
-                    tail.groupby(np.arange(len(tail)) // draws_per_step)["prediction"]
-                    .mean()
-                    .reset_index(drop=True)
-                    .to_frame("prediction")
-                )
+                if "forecast_index" in future_all.columns:
+                    future = (
+                        future_all.groupby("forecast_index")["prediction"]
+                        .mean()
+                        .reset_index(drop=True)
+                        .to_frame("prediction")
+                    )
+                else:
+                    draws_per_step = max(1, len(future_all) // cfg.forecast_steps)
+                    tail = future_all.tail(draws_per_step * cfg.forecast_steps).reset_index(drop=True)
+                    future = (
+                        tail.groupby(np.arange(len(tail)) // draws_per_step)["prediction"]
+                        .mean()
+                        .reset_index(drop=True)
+                        .to_frame("prediction")
+                    )
 
-            future["date"] = future_dates[: len(future)]
-            future = future.sort_values("date").reset_index(drop=True)
+                future["date"] = future_dates[: len(future)]
+                future = future.sort_values("date").reset_index(drop=True)
 
-            fig, ax = plt.subplots(figsize=(20, 8))
-            ax.plot(ts_bsts["date"], ts_bsts["value"], linewidth=1.2, label="Series")
-            ax.scatter(df_subset.index[obs_mask_subset[target]], df_subset[target][obs_mask_subset[target]],
-                       s=30, edgecolor="black", linewidth=0.5, alpha=0.9, label="Observed")
-            ax.scatter(df_subset.index[interp_mask_subset[target]], df_subset[target][interp_mask_subset[target]],
-                       s=30, alpha=0.9, label="Interpolated")
-            ax.plot(ts_bsts["date"], ts_bsts["bsts_pred"], linewidth=1.2, label="BSTS Fitted")
-            ax.plot(future["date"], future["prediction"], linestyle="--", linewidth=2, label="BSTS Forecast")
-            ax.set_title(f"BSTS Forecast for '{target}'")
-            ax.grid(True, linestyle="--", alpha=0.5)
-            ax.legend()
-            set_x_ticks(ax, pd.DatetimeIndex(list(df_subset.index) + list(future["date"])), cfg.forecast_freq)
-            _savefig(figures_dir / f"{target}_bsts_forecast.png")
+                fig, ax = plt.subplots(figsize=(20, 8))
+                ax.plot(ts_bsts["date"], ts_bsts["value"], linewidth=1.2, label="Series")
+                ax.scatter(df_subset.index[obs_mask_subset[target]], df_subset[target][obs_mask_subset[target]],
+                           s=30, edgecolor="black", linewidth=0.5, alpha=0.9, label="Observed")
+                ax.scatter(df_subset.index[interp_mask_subset[target]], df_subset[target][interp_mask_subset[target]],
+                           s=30, alpha=0.9, label="Interpolated")
+                ax.plot(ts_bsts["date"], ts_bsts["bsts_pred"], linewidth=1.2, label="BSTS Fitted")
+                ax.plot(future["date"], future["prediction"], linestyle="--", linewidth=2, label="BSTS Forecast")
+                ax.set_title(f"BSTS Forecast for '{target}'")
+                ax.grid(True, linestyle="--", alpha=0.5)
+                ax.legend()
+                set_x_ticks(ax, pd.DatetimeIndex(list(df_subset.index) + list(future["date"])), cfg.forecast_freq)
+                _savefig(figures_dir / f"{target}_bsts_forecast.png")
 
             # residual anomalies from SARIMAX
             fitted_values_uni = model_uni_fit.fittedvalues
