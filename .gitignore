@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+debug_run_outputs/
+output_multivariate/
+*.png
+*.csv
+*.txt
+
+*.egg-info/
+build/
+dist/
