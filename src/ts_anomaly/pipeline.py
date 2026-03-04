@@ -2,20 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Union, IO, Any
+from typing import Any, IO, List, Tuple, Union
 
 import numpy as np
 import pandas as pd
-
 import matplotlib.pyplot as plt
+
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.api import VAR
+
+# Orbit BSTS (required on VM). If missing, we will fall back to SARIMAX forecast.
 try:
     from orbit.models import DLT
 except Exception:
     DLT = None
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-from statsmodels.tsa.api import VAR
-from statsmodels.tsa.stattools import adfuller
-from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
 
 # ---------------------------
@@ -35,10 +35,6 @@ class PipelineConfig:
 # IO + helpers
 # ---------------------------
 def load_and_merge_data(files: List[Tuple[Union[str, IO[bytes], Any], str]]) -> pd.DataFrame:
-    """
-    files: [(file_like_or_path, category_name), ...]
-    Each CSV must contain a Date column plus one or more numeric columns.
-    """
     dfs = []
     for fileobj, category in files:
         df = pd.read_csv(fileobj, parse_dates=["Date"], engine="python")
@@ -49,18 +45,14 @@ def load_and_merge_data(files: List[Tuple[Union[str, IO[bytes], Any], str]]) -> 
         df.index = df.index.ceil("D")
         df = df.sort_index()
 
-        # coerce all value columns to numeric
         for col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df = df.dropna(how="all")
-
-        # prefix
         df = df.rename(columns=lambda x: f"{category}_{x}")
         dfs.append(df)
 
-    df_merged = pd.concat(dfs, axis=1, join="outer").sort_index()
-    return df_merged
+    return pd.concat(dfs, axis=1, join="outer").sort_index()
 
 
 def resample_and_interpolate(df_merged: pd.DataFrame, cfg: PipelineConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -78,6 +70,7 @@ def resample_and_interpolate(df_merged: pd.DataFrame, cfg: PipelineConfig) -> tu
 
     method = cfg.interpolation_method
     order = cfg.interpolation_order
+
     if method == "pchip":
         df_interpolated = df_raw.interpolate(method="pchip").clip(lower=0)
     elif method == "polynomial":
@@ -90,8 +83,7 @@ def resample_and_interpolate(df_merged: pd.DataFrame, cfg: PipelineConfig) -> tu
 
 def max_ccf(series1: pd.Series, series2: pd.Series, max_lag: int = 5) -> tuple[float, int]:
     lags = range(-max_lag, max_lag + 1)
-    max_corr = 0.0
-    best_lag = 0
+    max_corr, best_lag = 0.0, 0
     for lag in lags:
         if lag > 0:
             corr = series1.corr(series2.shift(lag))
@@ -106,10 +98,16 @@ def max_ccf(series1: pd.Series, series2: pd.Series, max_lag: int = 5) -> tuple[f
     return max_corr, best_lag
 
 
-def set_x_ticks(ax: plt.Axes, idx: pd.DatetimeIndex, freq: str) -> None:
+def set_x_ticks(ax: plt.Axes, idx: pd.DatetimeIndex, freq: str, max_ticks: int = 12) -> None:
+    idx = pd.DatetimeIndex(idx)
+    if len(idx) == 0:
+        return
     xticks = pd.date_range(start=idx.min(), end=idx.max(), freq=freq)
+    if len(xticks) > max_ticks:
+        step = max(1, len(xticks) // max_ticks)
+        xticks = xticks[::step]
     ax.set_xticks(xticks)
-    ax.tick_params(axis="x", rotation=90, labelsize=8)
+    ax.tick_params(axis="x", rotation=45, labelsize=8)
 
 
 def init_anomaly_report(path: Path) -> None:
@@ -128,7 +126,7 @@ def update_anomaly_report(
     target: str,
     corr_threshold: float,
     max_lag: int,
-    model: str = "VAR",
+    model: str,
 ) -> None:
     resid_std = observed_residuals.std()
     threshold = 2 * resid_std
@@ -155,8 +153,6 @@ def update_anomaly_report(
 
                 if date not in aligned_var.index or pd.isna(aligned_var.loc[date]):
                     continue
-
-                # only compare to correlated vars if the var at that date is observed (not interpolated)
                 if not bool(obs_mask_subset[var].get(date, False)):
                     continue
 
@@ -172,8 +168,7 @@ def update_anomaly_report(
                 if (cc > corr_threshold and np.sign(delta_t) != np.sign(delta_v)) or \
                    (cc < -corr_threshold and np.sign(delta_t) == np.sign(delta_v)):
                     dir_desc = f"{'+' if delta_v > 0 else '-'} in {var} → {'+' if delta_t > 0 else '-'} in {target}"
-                    mismatch_note = f"{var} (r={cc:.2f}, lag={lag}): mismatch ({dir_desc})"
-                    trend_breaks.append(mismatch_note)
+                    trend_breaks.append(f"{var} (r={cc:.2f}, lag={lag}): mismatch ({dir_desc})")
 
             if trend_breaks:
                 log_file.write(f"{target} | {date.date()} | VAR | Correlation Trend Violation\n")
@@ -190,8 +185,13 @@ def update_anomaly_report(
 def _savefig(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
-    plt.savefig(path, dpi=250)
+    plt.savefig(path, dpi=200)
     plt.close()
+
+
+def _sanitize_filename(name: str) -> str:
+    # keep filenames safe
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in name)[:150]
 
 
 # ---------------------------
@@ -202,14 +202,6 @@ def run_pipeline(
     output_dir: Union[str, Path],
     cfg: PipelineConfig = PipelineConfig(),
 ) -> dict:
-    """
-    Runs your full pipeline and writes:
-      - summary.csv
-      - anomalies.txt
-      - many PNG plots under output_dir/figures/
-
-    Returns a dict with paths.
-    """
     output_dir = Path(output_dir)
     figures_dir = output_dir / "figures"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -238,11 +230,7 @@ def run_pipeline(
         for var in df_interpolated.columns:
             if var == target:
                 continue
-            cc, lag = max_ccf(
-                df_interpolated[target].dropna(),
-                df_interpolated[var].dropna(),
-                max_lag=cfg.max_lag,
-            )
+            cc, lag = max_ccf(df_interpolated[target].dropna(), df_interpolated[var].dropna(), max_lag=cfg.max_lag)
             if abs(cc) >= cfg.corr_threshold:
                 subset_vars.append(var)
                 correlation_info.append(f"{target}~{var}: r={cc:.2f}, lag={lag}")
@@ -257,38 +245,16 @@ def run_pipeline(
         notes = ""
         selected_lag_order = "N/A"
 
-        # ---------- Univariate SARIMAX ----------
+        safe_target = _sanitize_filename(target)
+
+        # ---------- SARIMAX (univariate) ----------
         if len(subset_vars) == 1:
             model_type = "SARIMAX"
             notes = "No correlated variables above threshold; univariate SARIMAX used."
 
             target_series = df_raw[target]
-            ts_clean = target_series.replace([np.inf, -np.inf], np.nan).dropna()
-            if not (ts_clean.empty or ts_clean.nunique() <= 1):
-                _ = adfuller(ts_clean)
 
-            # debug series + ACF/PACF
-            if len(ts_clean) >= 3 and ts_clean.nunique() > 1:
-                fig, ax = plt.subplots(figsize=(20, 8))
-                ax.plot(target_series, marker="o")
-                ax.set_title(f"Quick Check Plot for {target}")
-                set_x_ticks(ax, df_interpolated.index, cfg.forecast_freq)
-                ax.grid(True, linestyle="--", alpha=0.5)
-                _savefig(figures_dir / f"{target}_series_debug.png")
-
-                n_lags_plot = min(20, int((len(ts_clean) - 1) * 0.5))
-
-                plt.figure(figsize=(20, 8), dpi=250)
-                plot_acf(ts_clean, lags=n_lags_plot)
-                plt.title(f"ACF for {target}")
-                _savefig(figures_dir / f"{target}_acf.png")
-
-                plt.figure(figsize=(20, 8), dpi=250)
-                plot_pacf(ts_clean, lags=n_lags_plot)
-                plt.title(f"PACF for {target}")
-                _savefig(figures_dir / f"{target}_pacf.png")
-
-            # SARIMAX fit
+            # Fit SARIMAX for residual-based anomalies
             try:
                 model_uni = SARIMAX(
                     target_series,
@@ -301,7 +267,7 @@ def run_pipeline(
                 notes += f" SARIMAX model failed: {e}"
                 continue
 
-            # BSTS forecast plot (Orbit DLT). Skip if Orbit isn't installed on the host.
+            # --- Forecast plot (BSTS preferred, SARIMAX fallback) ---
             if DLT is not None:
                 ts_bsts = df_interpolated[[target]].reset_index()
                 ts_bsts.columns = ["date", "value"]
@@ -339,26 +305,41 @@ def run_pipeline(
                 future["date"] = future_dates[: len(future)]
                 future = future.sort_values("date").reset_index(drop=True)
 
-                fig, ax = plt.subplots(figsize=(20, 8))
+                fig, ax = plt.subplots(figsize=(16, 6))
                 ax.plot(ts_bsts["date"], ts_bsts["value"], linewidth=1.2, label="Series")
                 ax.scatter(df_subset.index[obs_mask_subset[target]], df_subset[target][obs_mask_subset[target]],
-                           s=30, edgecolor="black", linewidth=0.5, alpha=0.9, label="Observed")
+                           s=25, edgecolor="black", linewidth=0.4, alpha=0.9, label="Observed")
                 ax.scatter(df_subset.index[interp_mask_subset[target]], df_subset[target][interp_mask_subset[target]],
-                           s=30, alpha=0.9, label="Interpolated")
+                           s=25, alpha=0.8, label="Interpolated")
                 ax.plot(ts_bsts["date"], ts_bsts["bsts_pred"], linewidth=1.2, label="BSTS Fitted")
                 ax.plot(future["date"], future["prediction"], linestyle="--", linewidth=2, label="BSTS Forecast")
                 ax.set_title(f"BSTS Forecast for '{target}'")
-                ax.grid(True, linestyle="--", alpha=0.5)
+                ax.grid(True, linestyle="--", alpha=0.4)
                 ax.legend()
                 set_x_ticks(ax, pd.DatetimeIndex(list(df_subset.index) + list(future["date"])), cfg.forecast_freq)
-                _savefig(figures_dir / f"{target}_bsts_forecast.png")
+                _savefig(figures_dir / f"{safe_target}_forecast.png")
+            else:
+                # SARIMAX fallback forecast
+                fc = model_uni_fit.get_forecast(steps=cfg.forecast_steps).predicted_mean
+                fc_index = pd.date_range(start=df_subset.index.max(), periods=cfg.forecast_steps + 1, freq=cfg.forecast_freq)[1:]
+                fc = pd.Series(fc.values, index=fc_index).clip(lower=0)
 
-            # residual anomalies from SARIMAX
-            fitted_values_uni = model_uni_fit.fittedvalues
-            residuals_uni = df_subset[target].iloc[len(df_subset[target]) - len(fitted_values_uni):] - fitted_values_uni
-            threshold = 2 * residuals_uni.std()
-            residuals_obs_mask = obs_mask_subset[target].loc[residuals_uni.index]
-            observed_residuals = residuals_uni[residuals_obs_mask]
+                fig, ax = plt.subplots(figsize=(16, 6))
+                ax.plot(df_subset.index, df_subset[target], linewidth=1.2, label="Series")
+                ax.plot(fc.index, fc.values, linestyle="--", linewidth=2, label="SARIMAX Forecast")
+                ax.set_title(f"SARIMAX Forecast for '{target}'")
+                ax.grid(True, linestyle="--", alpha=0.4)
+                ax.legend()
+                set_x_ticks(ax, pd.DatetimeIndex(list(df_subset.index) + list(fc.index)), cfg.forecast_freq)
+                _savefig(figures_dir / f"{safe_target}_forecast.png")
+
+            # --- Anomalies (residual threshold on observed points only) ---
+            fitted_values = model_uni_fit.fittedvalues
+            residuals = df_subset[target].iloc[len(df_subset[target]) - len(fitted_values):] - fitted_values
+            threshold = 2 * residuals.std()
+
+            residuals_obs_mask = obs_mask_subset[target].loc[residuals.index]
+            observed_residuals = residuals[residuals_obs_mask]
             anomalies = observed_residuals.abs() > threshold
             anomaly_count = int(anomalies.sum())
             anomaly_indices = observed_residuals.index[anomalies]
@@ -375,20 +356,23 @@ def run_pipeline(
                 model="SARIMAX",
             )
 
-            fig, ax = plt.subplots(figsize=(20, 8))
-            ax.plot(residuals_uni.index, residuals_uni, marker="o", label="Residuals")
-            ax.hlines([threshold, -threshold], xmin=residuals_uni.index[0], xmax=residuals_uni.index[-1],
-                      linestyles="--", label="Threshold")
+            # Time series anomaly plot (ONLY)
+            fig, ax = plt.subplots(figsize=(16, 6))
+            ax.plot(df_subset.index, df_subset[target], linewidth=1.2, label="Series")
+            ax.scatter(df_subset.index[obs_mask_subset[target]], df_subset[target][obs_mask_subset[target]],
+                       s=25, edgecolor="black", linewidth=0.4, alpha=0.9, label="Observed")
+            ax.scatter(df_subset.index[interp_mask_subset[target]], df_subset[target][interp_mask_subset[target]],
+                       s=25, alpha=0.8, label="Interpolated")
             if len(anomaly_indices) > 0:
-                ax.scatter(anomaly_indices, observed_residuals.loc[anomaly_indices],
-                           s=50, edgecolor="black", linewidth=0.5, label="Anomaly", zorder=5)
-            ax.set_title(f"Residuals and Anomalies for '{target}' (SARIMAX)")
-            ax.grid(True, linestyle="--", alpha=0.5)
+                ax.scatter(anomaly_indices, df_subset[target].loc[anomaly_indices],
+                           s=45, edgecolor="black", linewidth=0.4, label="Anomaly", zorder=5)
+            ax.set_title(f"Anomalies for '{target}' (SARIMAX)")
+            ax.grid(True, linestyle="--", alpha=0.4)
             ax.legend()
-            set_x_ticks(ax, residuals_uni.index, cfg.forecast_freq)
-            _savefig(figures_dir / f"{target}_residuals_anomalies_univariate.png")
+            set_x_ticks(ax, df_subset.index, cfg.forecast_freq)
+            _savefig(figures_dir / f"{safe_target}_anomalies.png")
 
-        # ---------- VAR ----------
+        # ---------- VAR (multivariate) ----------
         else:
             model_type = "VAR"
 
@@ -398,6 +382,7 @@ def run_pipeline(
                 notes = f"Not enough observations to fit a VAR model for variables {subset_vars}."
                 continue
 
+            # drop any row where the target was interpolated
             df_train_var = df_subset[obs_mask_subset[target]]
             var_model = VAR(df_train_var)
 
@@ -415,10 +400,73 @@ def run_pipeline(
                 notes += f" VAR model fitting failed: {e}"
                 continue
 
-            # residual anomalies from VAR
+            # Forecast plot (BSTS preferred; otherwise VAR forecast)
+            if DLT is not None:
+                ts_bsts = df_interpolated[[target]].reset_index()
+                ts_bsts.columns = ["date", "value"]
+
+                bsts_model = DLT(response_col="value", date_col="date", seasonality=12, seed=42)
+                bsts_model.fit(ts_bsts)
+
+                bsts_fit = bsts_model.predict(ts_bsts)
+                ts_bsts["bsts_pred"] = bsts_fit["prediction"]
+
+                future_all = bsts_model.predict(df=ts_bsts[["date", "value"]], forecast_horizon=cfg.forecast_steps)
+                future_dates = pd.date_range(
+                    start=ts_bsts["date"].max(),
+                    periods=cfg.forecast_steps + 1,
+                    freq=cfg.forecast_freq,
+                )[1:]
+
+                if "forecast_index" in future_all.columns:
+                    future = future_all.groupby("forecast_index")["prediction"].mean().reset_index(drop=True).to_frame("prediction")
+                else:
+                    draws_per_step = max(1, len(future_all) // cfg.forecast_steps)
+                    tail = future_all.tail(draws_per_step * cfg.forecast_steps).reset_index(drop=True)
+                    future = (
+                        tail.groupby(np.arange(len(tail)) // draws_per_step)["prediction"]
+                        .mean()
+                        .reset_index(drop=True)
+                        .to_frame("prediction")
+                    )
+
+                future["date"] = future_dates[: len(future)]
+                future = future.sort_values("date").reset_index(drop=True)
+
+                fig, ax = plt.subplots(figsize=(16, 6))
+                ax.plot(ts_bsts["date"], ts_bsts["value"], linewidth=1.2, label="Series")
+                ax.scatter(df_subset.index[obs_mask_subset[target]], df_subset[target][obs_mask_subset[target]],
+                           s=25, edgecolor="black", linewidth=0.4, alpha=0.9, label="Observed")
+                ax.scatter(df_subset.index[interp_mask_subset[target]], df_subset[target][interp_mask_subset[target]],
+                           s=25, alpha=0.8, label="Interpolated")
+                ax.plot(ts_bsts["date"], ts_bsts["bsts_pred"], linewidth=1.2, label="BSTS Fitted")
+                ax.plot(future["date"], future["prediction"], linestyle="--", linewidth=2, label="BSTS Forecast")
+                ax.set_title(f"BSTS Forecast for '{target}'")
+                ax.grid(True, linestyle="--", alpha=0.4)
+                ax.legend()
+                set_x_ticks(ax, pd.DatetimeIndex(list(df_subset.index) + list(future["date"])), cfg.forecast_freq)
+                _savefig(figures_dir / f"{safe_target}_forecast.png")
+            else:
+                # VAR forecast fallback
+                forecast_input = df_train_var.values[-selected_lag:]
+                forecast_values = var_model_fit.forecast(y=forecast_input, steps=cfg.forecast_steps)
+                forecast_index = pd.date_range(start=df_subset.index.max(), periods=cfg.forecast_steps + 1, freq=cfg.forecast_freq)[1:]
+                df_forecast = pd.DataFrame(forecast_values, index=forecast_index, columns=df_subset.columns).clip(lower=0)
+
+                fig, ax = plt.subplots(figsize=(16, 6))
+                ax.plot(df_subset.index, df_subset[target], linewidth=1.2, label="Series")
+                ax.plot(df_forecast.index, df_forecast[target], linestyle="--", linewidth=2, label="VAR Forecast")
+                ax.set_title(f"VAR Forecast for '{target}'")
+                ax.grid(True, linestyle="--", alpha=0.4)
+                ax.legend()
+                set_x_ticks(ax, pd.DatetimeIndex(list(df_subset.index) + list(df_forecast.index)), cfg.forecast_freq)
+                _savefig(figures_dir / f"{safe_target}_forecast.png")
+
+            # Residual anomalies from VAR (observed points only)
             fitted_values_var = var_model_fit.fittedvalues
             residuals_var = df_subset.iloc[selected_lag:][target] - fitted_values_var[target]
             threshold = 2 * residuals_var.std()
+
             residuals_obs_mask = obs_mask_subset[target].loc[residuals_var.index]
             observed_residuals_var = residuals_var[residuals_obs_mask]
             anomalies = observed_residuals_var.abs() > threshold
@@ -437,18 +485,21 @@ def run_pipeline(
                 model="VAR",
             )
 
-            fig, ax = plt.subplots(figsize=(20, 8))
-            ax.plot(residuals_var.index, residuals_var, marker="o", label="Residuals")
-            ax.hlines([threshold, -threshold], xmin=residuals_var.index[0], xmax=residuals_var.index[-1],
-                      linestyles="--", label="Threshold")
+            # Time series anomaly plot (ONLY)
+            fig, ax = plt.subplots(figsize=(16, 6))
+            ax.plot(df_subset.index, df_subset[target], linewidth=1.2, label="Series")
+            ax.scatter(df_subset.index[obs_mask_subset[target]], df_subset[target][obs_mask_subset[target]],
+                       s=25, edgecolor="black", linewidth=0.4, alpha=0.9, label="Observed")
+            ax.scatter(df_subset.index[interp_mask_subset[target]], df_subset[target][interp_mask_subset[target]],
+                       s=25, alpha=0.8, label="Interpolated")
             if len(anomaly_indices) > 0:
-                ax.scatter(anomaly_indices, observed_residuals_var.loc[anomaly_indices],
-                           s=50, edgecolor="black", linewidth=0.5, label="Anomaly", zorder=5)
-            ax.set_title(f"Residuals and Anomalies for '{target}' (VAR)")
-            ax.grid(True, linestyle="--", alpha=0.5)
+                ax.scatter(anomaly_indices, df_subset[target].loc[anomaly_indices],
+                           s=45, edgecolor="black", linewidth=0.4, label="Anomaly", zorder=5)
+            ax.set_title(f"Anomalies for '{target}' (VAR)")
+            ax.grid(True, linestyle="--", alpha=0.4)
             ax.legend()
-            set_x_ticks(ax, residuals_var.index, cfg.forecast_freq)
-            _savefig(figures_dir / f"{target}_residuals_anomalies_subset.png")
+            set_x_ticks(ax, df_subset.index, cfg.forecast_freq)
+            _savefig(figures_dir / f"{safe_target}_anomalies.png")
 
         summary_results.append({
             "Compound": target,
