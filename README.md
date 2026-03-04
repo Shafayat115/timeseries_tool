@@ -1,4 +1,11 @@
-# TS Anomaly Tool (Streamlit)
+# TS Anomaly Tool
+
+Streamlit app for time series forecasting and anomaly detection from one or more CSV files.
+
+<p align="center">
+  <img src="assets/forecasting.png" width="48%" />
+  <img src="assets/anomaly.png" width="48%" />
+</p>
 
 Upload one or more CSV files with:
 - `Date` column (parseable datetime)
