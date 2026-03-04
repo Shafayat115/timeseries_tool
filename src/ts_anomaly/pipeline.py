@@ -365,7 +365,8 @@ def run_pipeline(
                        s=25, alpha=0.8, label="Interpolated")
             if len(anomaly_indices) > 0:
                 ax.scatter(anomaly_indices, df_subset[target].loc[anomaly_indices],
-                           s=45, edgecolor="black", linewidth=0.4, label="Anomaly", zorder=5)
+                           color="red", s=45, edgecolor="black", linewidth=0.4,
+                           label="Anomaly", zorder=5)
             ax.set_title(f"Anomalies for '{target}' (SARIMAX)")
             ax.grid(True, linestyle="--", alpha=0.4)
             ax.legend()
@@ -494,7 +495,8 @@ def run_pipeline(
                        s=25, alpha=0.8, label="Interpolated")
             if len(anomaly_indices) > 0:
                 ax.scatter(anomaly_indices, df_subset[target].loc[anomaly_indices],
-                           s=45, edgecolor="black", linewidth=0.4, label="Anomaly", zorder=5)
+                           color="red", s=45, edgecolor="black", linewidth=0.4,
+                           label="Anomaly", zorder=5)
             ax.set_title(f"Anomalies for '{target}' (VAR)")
             ax.grid(True, linestyle="--", alpha=0.4)
             ax.legend()
