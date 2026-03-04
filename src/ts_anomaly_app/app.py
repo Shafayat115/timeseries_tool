@@ -61,7 +61,9 @@ def _run_cached(files_bytes: list[tuple[bytes, str, str]], cfg: PipelineConfig) 
         zip_bytes = _zip_dir(Path(paths["output_dir"]))
 
         # collect pngs to display
-        pngs = sorted(Path(paths["figures_dir"]).glob("*.png"))
+        # collect only the plots we want to display on the server
+        figdir = Path(paths["figures_dir"])
+        pngs = sorted(figdir.glob("*_forecast.png")) + sorted(figdir.glob("*_anomalies.png"))
         png_payloads = [(p.name, p.read_bytes()) for p in pngs]
 
         return {
